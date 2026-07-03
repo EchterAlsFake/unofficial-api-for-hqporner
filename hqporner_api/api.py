@@ -234,6 +234,12 @@ class VideoBuilder:
 
         self.html_content = html_content
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.clean()
+
     def enable_logging(self, name: str="HQPorner API - [Video]", log_file: str | None = None,
                        level: int | None = None, log_ip: str | None = None, log_port: int | None = None):
         if not level:
