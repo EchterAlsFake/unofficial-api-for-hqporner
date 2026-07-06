@@ -3,9 +3,9 @@ requires = ["uv_build>=0.9.18,<0.10.0"]
 build-backend = "uv_build"
 
 [project]
-name = "hqporner_api"
-version = "2.2"
-description = "A Python API for the Porn Site HQPorner.com"
+name = "unofficial-api-for-hqporner"
+version = "2.3"
+description = "An asynchronous Python API wrapper and scraper for HQPorner.com"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"
 license = "LGPL-3.0-only"
@@ -13,23 +13,42 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Johannes Habel", email = "EchterAlsFake@proton.me" }
 ]
+
+keywords = [
+    "api",
+    "scraper",
+    "async",
+    "asyncio",
+    "video-downloader",
+    "selectolax",
+    "curl-cffi",
+    "hqporner"
+]
 dependencies = [
     "selectolax",
     "eaf-base-api",
+    "curl_cffi",
 ]
+
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
     "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
-    "Programming Language :: Python",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Multimedia :: Video"
 ]
 
 [project.urls]
-Homepage = "https://github.com/EchterAlsFake/hqporner_api"
+Homepage = "https://github.com/EchterAlsFake/unofficial-api-for-hqporner"
+Repository = "https://github.com/EchterAlsFake/unofficial-api-for-hqporner"
+"Bug Tracker" = "https://github.com/EchterAlsFake/unofficial-api-for-hqporner/issues"
 
 [project.scripts]
 hqporner_api = "hqporner_api.api:main"
-
-[tool.setuptools]
-packages = { find = {} }
 
 [tool.uv.build-backend]
 module-name = "hqporner_api"
@@ -38,4 +57,3 @@ module-root = ""
 [tool.pytest.ini_options]
 asyncio_default_test_loop_scope = "session"
 asyncio_default_fixture_loop_scope = "session"
-
