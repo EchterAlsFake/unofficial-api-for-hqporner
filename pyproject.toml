@@ -27,8 +27,7 @@ keywords = [
 dependencies = [
     "selectolax",
     "eaf-base-api",
-    "curl_cffi",
-    "rich",
+    "curl_cffi"
 ]
 
 classifiers = [
@@ -41,6 +40,11 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Multimedia :: Video"
+]
+
+[project.optional-dependencies]
+cli = [
+    "rich",
 ]
 
 [project.urls]
