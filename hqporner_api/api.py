@@ -1,20 +1,16 @@
 from __future__ import annotations
-
-from datetime import time
-
-"""
-Copyright (C) Johannes Habel
-"""
 import os
 import re
+import copy
 import asyncio
 import logging
 import argparse
+from rich.console import Console
+from rich.table import Table
 from enum import Enum
 from random import choice
-from dataclasses import dataclass
-from functools import cached_property
-from typing import List, AsyncGenerator
+from typing import AsyncGenerator
+from dataclasses import dataclass, fields
 from curl_cffi import AsyncSession, Response
 from selectolax.lexbor import LexborHTMLParser
 from base_api import ScrapeResult, BaseCore, Helper, DownloadConfigRAW, BaseMedia
@@ -30,8 +26,13 @@ from hqporner_api.modules.consts import (root_random, root_url, root_url_categor
 from hqporner_api.modules.locals import Category, Sort
 from hqporner_api.modules.type_hints import on_error_hint
 
+
+logger = logging.getLogger("HQPorner API")
+logger.addHandler(logging.NullHandler())
+
+
 async def on_error(url: str, error: Exception, attempt: int) -> bool:
-    print(f"URL: {url}, ERROR: {error}, Attempt: {attempt}")
+    logger.error(f"URL: {url}, ERROR: {error}, Attempt: {attempt}")
 
     if isinstance(error, ResourceGone):
         return False
@@ -118,7 +119,7 @@ def build_page_url(base_url: str, page: int, *,
 
 
 def build_page_urls(base: str, pagination: Pagination = Pagination.QUERY, pages: int | None = None,
-                    page_param: str = "p", start_page: int = 1) -> List[str]:
+                    page_param: str = "p", start_page: int = 1) -> list[str]:
     page_urls = []
     base = base.rstrip("/")
     for i, page in enumerate(range(start_page, start_page + pages), start=0):
@@ -152,12 +153,10 @@ class Video(BaseMedia):
         is_mobile_fix, html_content = await get_html_content(core=self.core, url=self.url)
         assert isinstance(html_content, str)
         data: dict = await asyncio.to_thread(self._extract_html, is_mobile_fix, html_content)
-        self.title = data.get("title")
-        self.cdn_url = data.get("cdn_url")
-        self.pornstars = data.get("pornstars")
-        self.length = data.get("length")
-        self.publish_date = data.get("publish_date")
-        self.tags = data.get("tags")
+        allowed_fields = {field.name for field in fields(self)}
+        for key, value in data.items():
+            if key in allowed_fields:
+                setattr(self, key, value)
 
         cdn_url = f"https://{self.cdn_url}"
         is_mobile_fix, html_content = await get_html_content(core=self.core, url=cdn_url)
@@ -218,7 +217,7 @@ class Video(BaseMedia):
         if not quals:
             raise NotAvailable
 
-        config = configuration
+        config = copy.deepcopy(configuration)
 
         qn = normalize_quality_value(config.quality)
         chosen_height = choose_quality_from_list(quals, qn)
@@ -412,39 +411,109 @@ class Client:
             yield scrape_result
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="API Command Line Interface")
-    parser.add_argument("--download", metavar="URL (str)", type=str, help="URL to download from")
-    parser.add_argument("--quality", metavar="best,half,worst", type=str, help="The video quality (best,half,worst)",
-                        required=True)
-    parser.add_argument("--file", metavar="Source to .txt file", type=str,
-                        help="(Optional) Specify a file with URLs (separated with new lines)")
-    parser.add_argument("--output", metavar="Output directory", type=str, help="The output path (with filename)",
-                        required=True)
-    parser.add_argument("--no-title", metavar="True,False", type=str,
-                        help="Whether to apply video title automatically to output path or not", required=True)
+async def async_main():
+    parser = argparse.ArgumentParser(description="HQPorner API Command Line Interface")
+    
+    # Modes
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--download", metavar="URL", type=str, help="URL to download a single video from")
+    group.add_argument("--file", metavar="FILE", type=str, help="Specify a file with URLs (separated with new lines)")
+    group.add_argument("--search", metavar="QUERY", type=str, help="Search videos by query")
+    group.add_argument("--actress", metavar="NAME", type=str, help="Get videos by actress name or URL")
+    group.add_argument("--category", metavar="CATEGORY", type=str, help="Get videos by category")
+    group.add_argument("--random", action="store_true", help="Download a random video")
 
+    # Options
+    parser.add_argument("--quality", metavar="QUALITY", type=str, help="The video quality (best,half,worst, or e.g., 720)", required=True)
+    parser.add_argument("--output", metavar="DIR", type=str, help="The output path directory", required=True)
+    parser.add_argument("--no-title", metavar="True/False", type=str, default="False",
+                        help="Whether to apply video title automatically to output path or not")
+    parser.add_argument("--pages", metavar="N", type=int, default=1, help="Number of pages to fetch (default: 1)")
+    parser.add_argument("--concurrency", metavar="N", type=int, default=3, help="Max concurrent downloads (default: 3)")
 
     args = parser.parse_args()
-    config = DownloadConfigRAW(quality=args.quality, path=args.output, no_title=args.no_title)
+    
+    console = Console()
+    
+    no_title_bool = args.no_title.lower() in ("true", "1", "yes", "t", "y") if isinstance(args.no_title, str) else bool(args.no_title)
+    config = DownloadConfigRAW(quality=args.quality, path=args.output, no_title=no_title_bool)
+    
+    client = Client()
+    videos = []
+
     if args.download:
-        client = Client()
-        video = await client.get_video(args.download)
-        await video.download(configuration=config)
-
-    if args.file:
-        videos = []
-        client = Client()
-
+        console.print(f"[bold blue]Fetching video info for:[/bold blue] {args.download}")
+        videos.append(await client.get_video(args.download))
+        
+    elif args.file:
+        console.print(f"[bold blue]Reading URLs from:[/bold blue] {args.file}")
         with open(args.file, "r") as file:
             content = file.read().splitlines()
+            
+        async def fetch_video(url):
+            return await client.get_video(url)
+            
+        fetched = await asyncio.gather(*[fetch_video(url) for url in content if url.strip()])
+        videos.extend(fetched)
+        
+    elif args.random:
+        console.print("[bold blue]Fetching a random video...[/bold blue]")
+        videos.append(await client.get_random_video())
+        
+    elif args.search:
+        console.print(f"[bold blue]Searching for:[/bold blue] {args.search}")
+        async for scrape_result in client.search_videos(args.search, pages=args.pages):
+            videos.extend(scrape_result.videos)
+                
+    elif args.actress:
+        console.print(f"[bold blue]Fetching videos for actress:[/bold blue] {args.actress}")
+        async for scrape_result in client.get_videos_by_actress(args.actress, pages=args.pages):
+            videos.extend(scrape_result.videos)
+                
+    elif args.category:
+        console.print(f"[bold blue]Fetching videos for category:[/bold blue] {args.category}")
+        async for scrape_result in client.get_videos_by_category(args.category, pages=args.pages):
+            videos.extend(scrape_result.videos)
 
-        for url in content:
-            videos.append(await client.get_video(url))
+    if not videos:
+        console.print("[bold red]No videos found to download.[/bold red]")
+        return
+        
+    table = Table(title="Videos to Download")
+    table.add_column("Title", style="cyan")
+    table.add_column("Length", style="magenta")
+    table.add_column("URL", style="green", overflow="fold")
+    
+    for v in videos:
+        table.add_row(v.title or "Unknown", v.length or "Unknown", v.url)
+        
+    console.print(table)
+    console.print(f"\n[bold yellow]Starting download of {len(videos)} video(s) with concurrency {args.concurrency}...[/bold yellow]\n")
 
-        for video in videos:
-            await video.download(configuration=config)
+    semaphore = asyncio.Semaphore(args.concurrency)
+    
+    async def safe_download(video):
+        async with semaphore:
+            try:
+                if not video.direct_download_urls:
+                    await video.load(html=True)
+                console.print(f"[cyan]Downloading ->[/cyan] {video.title}")
+                await video.download(configuration=config)
+                console.print(f"[bold green]Done ->[/bold green] {video.title}")
+            except Exception as e:
+                console.print(f"[bold red]Error downloading {video.title or video.url}:[/bold red] {e}")
 
+    tasks = [safe_download(v) for v in videos]
+    await asyncio.gather(*tasks)
+    
+    console.print("[bold green]All downloads completed![/bold green]")
+
+
+def main():
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

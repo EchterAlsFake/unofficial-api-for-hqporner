@@ -28,6 +28,7 @@ dependencies = [
     "selectolax",
     "eaf-base-api",
     "curl_cffi",
+    "rich",
 ]
 
 classifiers = [
@@ -46,6 +47,9 @@ classifiers = [
 Homepage = "https://github.com/EchterAlsFake/unofficial-api-for-hqporner"
 Repository = "https://github.com/EchterAlsFake/unofficial-api-for-hqporner"
 "Bug Tracker" = "https://github.com/EchterAlsFake/unofficial-api-for-hqporner/issues"
+"Support me on Ko-Fi" = "https://ko-fi.com/EchterAlsFake"
+"Donate via PayPal" = "https://paypal.me/EchterAlsFake"
+"Donate via Crypto" = "https://nowpayments.io/donation/EchterAlsFake"
 
 [project.scripts]
 hqporner_api = "hqporner_api.api:main"
