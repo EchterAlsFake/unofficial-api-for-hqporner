@@ -38,6 +38,9 @@ def extractor_html(content: str):
         else:
             title, url = None, None
 
+        if not isinstance(url, str) or not url:
+            continue
+
         length_el = video.css_first("span.fa-clock-o")
         length = length_el.text(strip=True) if length_el else None
 
