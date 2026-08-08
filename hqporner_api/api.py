@@ -13,17 +13,16 @@ from typing import AsyncGenerator, ClassVar
 from dataclasses import dataclass
 from curl_cffi import AsyncSession
 from selectolax.lexbor import LexborHTMLParser
+from base_api.modules.config import IteratorConfig
 from base_api import (
     BaseCore,
     BaseMedia,
     DownloadConfigRAW,
     ErrorAction,
-    ErrorHandler,
     ErrorMode,
     Helper,
     MediaLoadError,
     MediaLoadErrors,
-    ResultOrder,
     RetryPolicy,
     ScrapeErrorContext,
     ScrapeResult,
@@ -53,6 +52,17 @@ logger = logging.getLogger("HQPorner API")
 logger.addHandler(logging.NullHandler())
 
 SCRAPE_RETRY_POLICY = RetryPolicy(max_attempts=3)
+
+
+def make_iterator_config() -> IteratorConfig:
+    return IteratorConfig(
+        load_specific_sources=("html",),
+        item_retry=SCRAPE_RETRY_POLICY,
+        page_retry=SCRAPE_RETRY_POLICY,
+        page_error_mode=ErrorMode.SKIP,
+        item_error_handler=None,
+        page_error_handler=None,
+    )
 
 
 def _is_resource_gone(error: BaseException) -> bool:
@@ -286,25 +296,15 @@ class Client:
         self,
         page_urls: list[str],
         *,
-        videos_concurrency: int,
-        pages_concurrency: int,
-        load_html: bool,
-        keep_original_order: bool,
-        on_video_error: ErrorHandler | None,
-        on_page_error: ErrorHandler | None,
+        iterator_config: IteratorConfig | None = None,
     ):
+        if iterator_config is None:
+            iterator_config = make_iterator_config()
+
         return self.helper.iterator(
             target_page_urls=page_urls,
             item_extractor=extractor_html,
-            max_page_concurrency=pages_concurrency,
-            max_item_concurrency=videos_concurrency,
-            load_sources=("html",) if load_html else (),
-            order=(ResultOrder.ORIGINAL if keep_original_order else ResultOrder.COMPLETION),
-            page_error_mode=ErrorMode.SKIP,
-            page_retry=SCRAPE_RETRY_POLICY,
-            item_retry=SCRAPE_RETRY_POLICY,
-            item_error_handler=on_video_error,
-            page_error_handler=on_page_error,
+            iterator_config=iterator_config,
         )
 
     async def get_video(self, url: str, load_html: bool = True) -> Video:
@@ -317,124 +317,77 @@ class Client:
             await video.load_sources("html")
         return video
 
-    async def get_videos_by_actress(self, name: str, pages: int = 5, videos_concurrency: int | None = None,
-                            pages_concurrency: int | None = None,
-                            on_video_error: ErrorHandler | None = on_error,
-                            on_page_error: ErrorHandler | None = None,
-                            load_html: bool = False,
-                            keep_original_order: bool = False) -> AsyncGenerator[ScrapeResult, None]:
+    async def get_videos_by_actress(
+        self,
+        name: str,
+        pages: int = 5,
+        iterator_config: IteratorConfig | None = None,
+    ) -> AsyncGenerator[ScrapeResult, None]:
         """
         :param pages: (int) The number of pages to fetch
         :param name: The actress name or the URL
-        :param videos_concurrency: (int) How many threads to use to fetch videos
-        :param pages_concurrency: (int) How many threads to use to fetch pages
-        :param on_page_error:
-        :param on_video_error:
-        :param keep_original_order:
+        :param iterator_config: Iterator concurrency, loading, ordering, and error behavior.
         :return: Video object
         """
         name = Checks().check_actress(name)
         final_url = f"{root_url_actress}{name}"
         page_urls = build_page_urls(pagination=Pagination.PATH, base=final_url, pages=pages, start_page=0)
 
-        videos_concurrency = videos_concurrency or self.core.configuration.videos_concurrency
-        pages_concurrency = pages_concurrency or self.core.configuration.pages_concurrency
-        assert videos_concurrency and pages_concurrency
-        stream = self._video_stream(
-            page_urls,
-            videos_concurrency=videos_concurrency,
-            pages_concurrency=pages_concurrency,
-            load_html=load_html,
-            keep_original_order=keep_original_order,
-            on_video_error=on_video_error,
-            on_page_error=on_page_error,
-        )
+        stream = self._video_stream(page_urls, iterator_config=iterator_config)
         async with stream:
             async for scrape_result in stream:
                 yield scrape_result
 
-    async def get_videos_by_category(self, category: Category | str, pages: int = 5, videos_concurrency: int | None = None,
-                            pages_concurrency: int | None = None,
-                                     on_video_error: ErrorHandler | None = on_error,
-                                     on_page_error: ErrorHandler | None = None,
-                                     keep_original_order: bool = False,
-                                     load_html: bool = False,
-                                     ) -> AsyncGenerator[ScrapeResult, None]:
+    async def get_videos_by_category(
+        self,
+        category: Category | str,
+        pages: int = 5,
+        iterator_config: IteratorConfig | None = None,
+    ) -> AsyncGenerator[ScrapeResult, None]:
         """
         :param pages: (int) The number of pages to fetch
         :param category: Category: The video category
-        :param videos_concurrency: (int) How many threads to use to fetch videos
-        :param pages_concurrency: (int) How many threads to use to fetch pages
-        :param on_video_error:
-        :param on_page_error:
-        :param keep_original_order:
+        :param iterator_config: Iterator concurrency, loading, ordering, and error behavior.
         :return: Video object
         """
         url = f"{root_url_category}{category}"
         page_urls = build_page_urls(pagination=Pagination.PATH, base=url, pages=pages, start_page=0)
-        videos_concurrency = videos_concurrency or self.core.configuration.videos_concurrency
-        pages_concurrency = pages_concurrency or self.core.configuration.pages_concurrency
-        assert videos_concurrency and pages_concurrency
-        stream = self._video_stream(
-            page_urls,
-            videos_concurrency=videos_concurrency,
-            pages_concurrency=pages_concurrency,
-            load_html=load_html,
-            keep_original_order=keep_original_order,
-            on_video_error=on_video_error,
-            on_page_error=on_page_error,
-        )
+        stream = self._video_stream(page_urls, iterator_config=iterator_config)
         async with stream:
             async for scrape_result in stream:
                 yield scrape_result
 
 
-    async def search_videos(self, query: str, pages: int = 5, videos_concurrency: int | None = None,
-                            pages_concurrency: int | None = None, on_video_error: ErrorHandler | None = on_error,
-                            on_page_error: ErrorHandler | None = None,
-                            load_html: bool = False,
-                            keep_original_order: bool = False) -> AsyncGenerator[ScrapeResult, None]:
+    async def search_videos(
+        self,
+        query: str,
+        pages: int = 5,
+        iterator_config: IteratorConfig | None = None,
+    ) -> AsyncGenerator[ScrapeResult, None]:
         """
         :param query:
         :param pages: (int) How many pages to fetch
-        :param videos_concurrency: (int) How many threads to use to fetch videos
-        :param pages_concurrency: (int) How many threads to use to fetch pages
-        :param on_video_error:
-        :param on_page_error:
-        :param keep_original_order:
+        :param iterator_config: Iterator concurrency, loading, ordering, and error behavior.
         :return: Video object
         """
         query = query.replace(" ", "+")
         url = f"{root_url}?q={query}"
         page_urls = build_page_urls(pagination=Pagination.QUERY, base=url, pages=pages, start_page=1)
-        videos_concurrency = videos_concurrency or self.core.configuration.videos_concurrency
-        pages_concurrency = pages_concurrency or self.core.configuration.pages_concurrency
-        assert videos_concurrency and pages_concurrency
-        stream = self._video_stream(
-            page_urls,
-            videos_concurrency=videos_concurrency,
-            pages_concurrency=pages_concurrency,
-            load_html=load_html,
-            keep_original_order=keep_original_order,
-            on_video_error=on_video_error,
-            on_page_error=on_page_error,
-        )
+        stream = self._video_stream(page_urls, iterator_config=iterator_config)
         async with stream:
             async for scrape_result in stream:
                 yield scrape_result
 
-    async def get_top_porn(self, sort_by: Sort | str, pages: int = 5,videos_concurrency: int | None = None,
-                           pages_concurrency: int | None = None, on_video_error: ErrorHandler | None = on_error,
-                           on_page_error: ErrorHandler | None = None, load_html: bool = False,
-                           keep_original_order: bool = False) -> AsyncGenerator[ScrapeResult, None]:
+    async def get_top_porn(
+        self,
+        sort_by: Sort | str,
+        pages: int = 5,
+        iterator_config: IteratorConfig | None = None,
+    ) -> AsyncGenerator[ScrapeResult, None]:
         """
         :param pages: (int) How many pages to fetch
         :param sort_by: all_time, month, week
-        :param videos_concurrency: (int) How many threads to use to fetch videos
-        :param pages_concurrency: (int) How many threads to use to fetch pages
-        :param on_video_error:
-        :param on_page_error:
-        :param keep_original_order:
+        :param iterator_config: Iterator concurrency, loading, ordering, and error behavior.
         :return: Video object
         """
         if sort_by == "all_time":
@@ -444,18 +397,7 @@ class Client:
             url = f"{root_url_top}{sort_by}"
 
         page_urls = build_page_urls(base=url, start_page=0, pagination=Pagination.PATH, pages=pages)
-        videos_concurrency = videos_concurrency or self.core.configuration.videos_concurrency
-        pages_concurrency = pages_concurrency or self.core.configuration.pages_concurrency
-        assert videos_concurrency and pages_concurrency
-        stream = self._video_stream(
-            page_urls,
-            videos_concurrency=videos_concurrency,
-            pages_concurrency=pages_concurrency,
-            load_html=load_html,
-            keep_original_order=keep_original_order,
-            on_video_error=on_video_error,
-            on_page_error=on_page_error,
-        )
+        stream = self._video_stream(page_urls, iterator_config=iterator_config)
         async with stream:
             async for scrape_result in stream:
                 yield scrape_result
@@ -483,32 +425,18 @@ class Client:
             await video.load_sources("html")
         return video
 
-    async def get_brazzers_videos(self, pages: int = 5, videos_concurrency: int | None = None,
-                            pages_concurrency: int | None = None, on_video_error: ErrorHandler | None = on_error,
-                            on_page_error: ErrorHandler | None = None, load_html: bool = False,
-                            keep_original_order: bool = False) -> AsyncGenerator[ScrapeResult, None]:
+    async def get_brazzers_videos(
+        self,
+        pages: int = 5,
+        iterator_config: IteratorConfig | None = None,
+    ) -> AsyncGenerator[ScrapeResult, None]:
         """
         :param pages: (int) How many pages to fetch
-        :param videos_concurrency: (int) How many threads to use to fetch videos
-        :param pages_concurrency: (int) How many threads to use to fetch pages
-        :param on_video_error:
-        :param on_page_error:
-        :param keep_original_order:
+        :param iterator_config: Iterator concurrency, loading, ordering, and error behavior.
         :return: Video object
         """
         page_urls = build_page_urls(pagination=Pagination.PATH, pages=pages, base=root_brazzers, start_page=0)
-        videos_concurrency = videos_concurrency or self.core.configuration.videos_concurrency
-        pages_concurrency = pages_concurrency or self.core.configuration.pages_concurrency
-        assert videos_concurrency and pages_concurrency
-        stream = self._video_stream(
-            page_urls,
-            videos_concurrency=videos_concurrency,
-            pages_concurrency=pages_concurrency,
-            load_html=load_html,
-            keep_original_order=keep_original_order,
-            on_video_error=on_video_error,
-            on_page_error=on_page_error,
-        )
+        stream = self._video_stream(page_urls, iterator_config=iterator_config)
         async with stream:
             async for scrape_result in stream:
                 yield scrape_result
