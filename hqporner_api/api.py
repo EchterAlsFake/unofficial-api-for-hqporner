@@ -57,8 +57,8 @@ SCRAPE_RETRY_POLICY = RetryPolicy(max_attempts=3)
 def make_iterator_config() -> IteratorConfig:
     return IteratorConfig(
         load_specific_sources=("html",),
-        item_retry=SCRAPE_RETRY_POLICY,
-        page_retry=SCRAPE_RETRY_POLICY,
+        item_retry=None,
+        page_retry=None,
         page_error_mode=ErrorMode.SKIP,
         item_error_handler=None,
         page_error_handler=None,
@@ -322,7 +322,7 @@ class Client:
         name: str,
         pages: int = 5,
         iterator_config: IteratorConfig | None = None,
-    ) -> AsyncGenerator[ScrapeResult, None]:
+    ) -> AsyncGenerator[ScrapeResult[Video], None]:
         """
         :param pages: (int) The number of pages to fetch
         :param name: The actress name or the URL
@@ -343,7 +343,7 @@ class Client:
         category: Category | str,
         pages: int = 5,
         iterator_config: IteratorConfig | None = None,
-    ) -> AsyncGenerator[ScrapeResult, None]:
+    ) -> AsyncGenerator[ScrapeResult[Video], None]:
         """
         :param pages: (int) The number of pages to fetch
         :param category: Category: The video category
@@ -363,7 +363,7 @@ class Client:
         query: str,
         pages: int = 5,
         iterator_config: IteratorConfig | None = None,
-    ) -> AsyncGenerator[ScrapeResult, None]:
+    ) -> AsyncGenerator[ScrapeResult[Video], None]:
         """
         :param query:
         :param pages: (int) How many pages to fetch
@@ -383,7 +383,7 @@ class Client:
         sort_by: Sort | str,
         pages: int = 5,
         iterator_config: IteratorConfig | None = None,
-    ) -> AsyncGenerator[ScrapeResult, None]:
+    ) -> AsyncGenerator[ScrapeResult[Video], None]:
         """
         :param pages: (int) How many pages to fetch
         :param sort_by: all_time, month, week
@@ -429,7 +429,7 @@ class Client:
         self,
         pages: int = 5,
         iterator_config: IteratorConfig | None = None,
-    ) -> AsyncGenerator[ScrapeResult, None]:
+    ) -> AsyncGenerator[ScrapeResult[Video], None]:
         """
         :param pages: (int) How many pages to fetch
         :param iterator_config: Iterator concurrency, loading, ordering, and error behavior.

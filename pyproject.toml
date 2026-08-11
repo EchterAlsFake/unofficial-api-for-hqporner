@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "unofficial-api-for-hqporner"
-version = "2.4"
+version = "2.5"
 description = "An asynchronous Python API wrapper and scraper for HQPorner.com"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"
@@ -27,7 +27,7 @@ keywords = [
 dependencies = [
     "selectolax",
     "eaf-base-api>=4.0.0",
-    "curl_cffi"
+    "curl_cffi",
 ]
 
 classifiers = [
