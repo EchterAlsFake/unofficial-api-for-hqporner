@@ -5,8 +5,12 @@ import copy
 import asyncio
 import logging
 import argparse
-from rich.console import Console
-from rich.table import Table
+try:
+    from rich.console import Console
+    from rich.table import Table
+except ImportError:
+    Console = None
+    Table = None
 from enum import Enum
 from random import choice
 from typing import AsyncGenerator, ClassVar
@@ -27,6 +31,10 @@ from base_api import (
     ScrapeErrorContext,
     ScrapeResult,
     media_field,
+    make_iterator_config,
+    is_resource_gone,
+    default_on_error,
+    scrape_stream,
 )
 from base_api.modules.static_functions import choose_quality_from_list, normalize_quality_value
 from base_api.modules.errors import (
@@ -53,41 +61,8 @@ logger.addHandler(logging.NullHandler())
 
 SCRAPE_RETRY_POLICY = RetryPolicy(max_attempts=3)
 
-
-def make_iterator_config() -> IteratorConfig:
-    return IteratorConfig(
-        load_specific_sources=("html",),
-        item_retry=None,
-        page_retry=None,
-        page_error_mode=ErrorMode.SKIP,
-        item_error_handler=None,
-        page_error_handler=None,
-    )
-
-
-def _is_resource_gone(error: BaseException) -> bool:
-    if isinstance(error, ResourceGone):
-        return True
-    if isinstance(error, MediaLoadError):
-        return _is_resource_gone(error.original_error)
-    if isinstance(error, MediaLoadErrors):
-        return any(_is_resource_gone(item) for item in error.errors)
-    return False
-
-
-async def on_error(context: ScrapeErrorContext) -> ErrorAction:
-    logger.error(
-        "URL: %s, ERROR: %s, Attempt: %s/%s",
-        context.url,
-        context.error,
-        context.attempt,
-        context.max_attempts,
-    )
-
-    if _is_resource_gone(context.error):
-        return ErrorAction.SKIP
-
-    return ErrorAction.RETRY
+_is_resource_gone = is_resource_gone
+on_error = default_on_error
 
 
 async def get_html_content(core: BaseCore, url: str, is_second_attempt: bool = False,
@@ -285,7 +260,9 @@ class Video(BaseMedia):
 
 
 class Client:
-    def __init__(self, core: BaseCore = BaseCore()):
+    def __init__(self, core: BaseCore | None = None):
+        if core is None:
+            core = BaseCore()
         self.core = core
         self.core.initialize_session()
         self.helper = Helper(core=self.core, constructor=Video)
@@ -297,11 +274,10 @@ class Client:
         page_urls: list[str],
         *,
         iterator_config: IteratorConfig | None = None,
-    ):
-        if iterator_config is None:
-            iterator_config = make_iterator_config()
-
-        return self.helper.iterator(
+    ) -> AsyncGenerator[ScrapeResult[Video], None]:
+        return scrape_stream(
+            core=self.core,
+            constructor=Video,
             target_page_urls=page_urls,
             item_extractor=extractor_html,
             iterator_config=iterator_config,
@@ -317,7 +293,7 @@ class Client:
             await video.load_sources("html")
         return video
 
-    async def get_videos_by_actress(
+    def get_videos_by_actress(
         self,
         name: str,
         pages: int = 5,
@@ -332,13 +308,9 @@ class Client:
         name = Checks().check_actress(name)
         final_url = f"{root_url_actress}{name}"
         page_urls = build_page_urls(pagination=Pagination.PATH, base=final_url, pages=pages, start_page=0)
+        return self._video_stream(page_urls, iterator_config=iterator_config)
 
-        stream = self._video_stream(page_urls, iterator_config=iterator_config)
-        async with stream:
-            async for scrape_result in stream:
-                yield scrape_result
-
-    async def get_videos_by_category(
+    def get_videos_by_category(
         self,
         category: Category | str,
         pages: int = 5,
@@ -352,13 +324,9 @@ class Client:
         """
         url = f"{root_url_category}{category}"
         page_urls = build_page_urls(pagination=Pagination.PATH, base=url, pages=pages, start_page=0)
-        stream = self._video_stream(page_urls, iterator_config=iterator_config)
-        async with stream:
-            async for scrape_result in stream:
-                yield scrape_result
+        return self._video_stream(page_urls, iterator_config=iterator_config)
 
-
-    async def search_videos(
+    def search_videos(
         self,
         query: str,
         pages: int = 5,
@@ -373,12 +341,9 @@ class Client:
         query = query.replace(" ", "+")
         url = f"{root_url}?q={query}"
         page_urls = build_page_urls(pagination=Pagination.QUERY, base=url, pages=pages, start_page=1)
-        stream = self._video_stream(page_urls, iterator_config=iterator_config)
-        async with stream:
-            async for scrape_result in stream:
-                yield scrape_result
+        return self._video_stream(page_urls, iterator_config=iterator_config)
 
-    async def get_top_porn(
+    def get_top_porn(
         self,
         sort_by: Sort | str,
         pages: int = 5,
@@ -392,15 +357,10 @@ class Client:
         """
         if sort_by == "all_time":
             url = root_url_top
-
         else:
             url = f"{root_url_top}{sort_by}"
-
         page_urls = build_page_urls(base=url, start_page=0, pagination=Pagination.PATH, pages=pages)
-        stream = self._video_stream(page_urls, iterator_config=iterator_config)
-        async with stream:
-            async for scrape_result in stream:
-                yield scrape_result
+        return self._video_stream(page_urls, iterator_config=iterator_config)
 
     async def get_all_categories(self) -> list[str]:
         """
@@ -425,7 +385,7 @@ class Client:
             await video.load_sources("html")
         return video
 
-    async def get_brazzers_videos(
+    def get_brazzers_videos(
         self,
         pages: int = 5,
         iterator_config: IteratorConfig | None = None,
@@ -436,13 +396,10 @@ class Client:
         :return: Video object
         """
         page_urls = build_page_urls(pagination=Pagination.PATH, pages=pages, base=root_brazzers, start_page=0)
-        stream = self._video_stream(page_urls, iterator_config=iterator_config)
-        async with stream:
-            async for scrape_result in stream:
-                yield scrape_result
+        return self._video_stream(page_urls, iterator_config=iterator_config)
 
 
-async def async_main():
+def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="HQPorner API Command Line Interface")
     
     # Modes
@@ -455,16 +412,26 @@ async def async_main():
     group.add_argument("--random", action="store_true", help="Download a random video")
 
     # Options
-    parser.add_argument("--quality", metavar="QUALITY", type=str, help="The video quality (best,half,worst, or e.g., 720)", required=True)
+    parser.add_argument("--quality", metavar="QUALITY", type=str, default="best", help="The video quality (best,half,worst, or e.g., 720)")
     parser.add_argument("--output", metavar="DIR", type=str, help="The output path directory", required=True)
     parser.add_argument("--no-title", metavar="True/False", type=str, default="False",
                         help="Whether to apply video title automatically to output path or not")
     parser.add_argument("--pages", metavar="N", type=int, default=1, help="Number of pages to fetch (default: 1)")
     parser.add_argument("--concurrency", metavar="N", type=int, default=3, help="Max concurrent downloads (default: 3)")
+    return parser
 
-    args = parser.parse_args()
+
+async def async_main(args_list: list[str] | None = None):
+    parser = create_parser()
+    args = parser.parse_args(args_list)
     
-    console = Console()
+    console = Console() if Console else None
+    
+    def log(msg, style=""):
+        if console:
+            console.print(f"[{style}]{msg}[/{style}]" if style else msg)
+        else:
+            print(msg)
     
     no_title_bool = args.no_title.lower() in ("true", "1", "yes", "t", "y") if isinstance(args.no_title, str) else bool(args.no_title)
     config = DownloadConfigRAW(quality=args.quality, path=args.output, no_title=no_title_bool)
@@ -473,11 +440,11 @@ async def async_main():
     videos = []
 
     if args.download:
-        console.print(f"[bold blue]Fetching video info for:[/bold blue] {args.download}")
+        log(f"Fetching video info for: {args.download}", "bold blue")
         videos.append(await client.get_video(args.download))
         
     elif args.file:
-        console.print(f"[bold blue]Reading URLs from:[/bold blue] {args.file}")
+        log(f"Reading URLs from: {args.file}", "bold blue")
         with open(args.file, "r") as file:
             content = file.read().splitlines()
             
@@ -488,38 +455,41 @@ async def async_main():
         videos.extend(fetched)
         
     elif args.random:
-        console.print("[bold blue]Fetching a random video...[/bold blue]")
+        log("Fetching a random video...", "bold blue")
         videos.append(await client.get_random_video())
         
     elif args.search:
-        console.print(f"[bold blue]Searching for:[/bold blue] {args.search}")
+        log(f"Searching for: {args.search}", "bold blue")
         async for scrape_result in client.search_videos(args.search, pages=args.pages):
             videos.append(scrape_result.unwrap())
                 
     elif args.actress:
-        console.print(f"[bold blue]Fetching videos for actress:[/bold blue] {args.actress}")
+        log(f"Fetching videos for actress: {args.actress}", "bold blue")
         async for scrape_result in client.get_videos_by_actress(args.actress, pages=args.pages):
             videos.append(scrape_result.unwrap())
                 
     elif args.category:
-        console.print(f"[bold blue]Fetching videos for category:[/bold blue] {args.category}")
+        log(f"Fetching videos for category: {args.category}", "bold blue")
         async for scrape_result in client.get_videos_by_category(args.category, pages=args.pages):
             videos.append(scrape_result.unwrap())
 
     if not videos:
-        console.print("[bold red]No videos found to download.[/bold red]")
+        log("No videos found to download.", "bold red")
         return
         
-    table = Table(title="Videos to Download")
-    table.add_column("Title", style="cyan")
-    table.add_column("Length", style="magenta")
-    table.add_column("URL", style="green", overflow="fold")
-    
-    for v in videos:
-        table.add_row(v.title or "Unknown", v.length or "Unknown", v.url)
+    if console and Table:
+        table = Table(title="Videos to Download")
+        table.add_column("Title", style="cyan")
+        table.add_column("Length", style="magenta")
+        table.add_column("URL", style="green", overflow="fold")
+        for v in videos:
+            table.add_row(str(v.title or "Unknown"), str(v.length or "Unknown"), str(v.url or "Unknown"))
+        console.print(table)
+    else:
+        for v in videos:
+            print(f"- {v.title or 'Unknown'} ({v.length or 'Unknown'}): {v.url}")
         
-    console.print(table)
-    console.print(f"\n[bold yellow]Starting download of {len(videos)} video(s) with concurrency {args.concurrency}...[/bold yellow]\n")
+    log(f"\nStarting download of {len(videos)} video(s) with concurrency {args.concurrency}...\n", "bold yellow")
 
     semaphore = asyncio.Semaphore(args.concurrency)
     
@@ -527,16 +497,19 @@ async def async_main():
         async with semaphore:
             try:
                 await video.load_fields("direct_download_urls")
-                console.print(f"[cyan]Downloading ->[/cyan] {video.title}")
+                log(f"Downloading -> {video.title}", "cyan")
                 await video.download(configuration=config)
-                console.print(f"[bold green]Done ->[/bold green] {video.title}")
+                log(f"Done -> {video.title}", "bold green")
             except Exception as e:
-                console.print(f"[bold red]Error downloading {video.title or video.url}:[/bold red] {e}")
+                log(f"Error downloading {video.title or video.url}: {e}", "bold red")
 
     tasks = [safe_download(v) for v in videos]
     await asyncio.gather(*tasks)
     
-    console.print("[bold green]All downloads completed![/bold green]")
+    log("All downloads completed!", "bold green")
+
+
+run_main = async_main
 
 
 def main():
@@ -545,5 +518,7 @@ def main():
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
 
+
 if __name__ == "__main__":
     main()
+
