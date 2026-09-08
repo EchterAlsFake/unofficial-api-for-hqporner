@@ -5,6 +5,8 @@ import copy
 import asyncio
 import logging
 import argparse
+
+from base_api.modules.logger import configure_app_logging
 try:
     from rich.console import Console
     from rich.table import Table
@@ -38,6 +40,7 @@ from base_api import (
 )
 from base_api.modules.static_functions import choose_quality_from_list, normalize_quality_value
 from base_api.modules.errors import (
+    DownloadCancelled,
     BotProtectionDetected,
     HTTPStatusError,
     InvalidProxy,
@@ -72,6 +75,7 @@ async def get_html_content(core: BaseCore, url: str, is_second_attempt: bool = F
         return is_mobile_fix, content
 
     except HTTPStatusError as e:
+        logger.exception("Request failed for %s: %s", url, e)
         if e.status_code == 404:
             if is_second_attempt:
                 raise NotFound(f"Server returned 404 for: {url}") from e
@@ -83,19 +87,27 @@ async def get_html_content(core: BaseCore, url: str, is_second_attempt: bool = F
                 core=core,
                 is_mobile_fix=True,
             )
-        raise NetworkError(str(e)) from e
+        raise NetworkError(f"Request failed for {url}: {e}") from e
 
     except (NetworkRequestError, RequestRetriesExhausted) as e:
-        raise NetworkError(str(e)) from e
+        logger.exception("Request failed for %s: %s", url, e)
+        raise NetworkError(f"Request failed for {url}: {e}") from e
 
     except InvalidProxy as e:
-        raise ProxyError(str(e)) from e
+        logger.exception("Request failed for %s: %s", url, e)
+        raise ProxyError(f"Request failed for {url}: {e}") from e
 
     except BotProtectionDetected as e:
-        raise BotDetection(str(e)) from e
+        logger.exception("Request failed for %s: %s", url, e)
+        raise BotDetection(f"Request failed for {url}: {e}") from e
 
     except UnknownError as e:
-        raise UnknownNetworkError(str(e)) from e
+        logger.exception("Request failed for %s: %s", url, e)
+        raise UnknownNetworkError(f"Request failed for {url}: {e}") from e
+
+    except Exception:
+        logger.exception("Failed to fetch or decode response for %s", url)
+        raise
 
 
 
@@ -119,7 +131,7 @@ class Checks:
                 return name
 
             else:
-                raise InvalidActress
+                raise InvalidActress(f"Invalid actress URL: {actress}")
 
         else:
             actress = actress.replace(" ", "-")  # For later url processing (makes sense, trust me)
@@ -145,7 +157,7 @@ def build_page_url(base_url: str, page: int, *,
     elif mode is Pagination.PATH:
         return f"{base_url.rstrip('/')}/{page}"
 
-    raise ValueError("Please report this whatever you did")
+    raise ValueError(f"Unsupported pagination mode {mode!r} for {base_url}")
 
 
 def build_page_urls(base: str, pagination: Pagination = Pagination.QUERY, pages: int | None = None,
@@ -235,28 +247,33 @@ class Video(BaseMedia):
 
 
     async def download(self, configuration: DownloadConfigRAW):
-        await self.load_fields("direct_download_urls", "title")
-        cdn_urls = self.direct_download_urls
-        quals = self.video_qualities  # e.g., ["360", "480", "720"]
-        if not quals:
-            raise NotAvailable
-
-        config = copy.deepcopy(configuration)
-
-        qn = normalize_quality_value(config.quality)
-        chosen_height = choose_quality_from_list(quals, qn)
-
-        quality_url_map = {int(re.search(r'(\d{3,4})', q).group(1)): url for q, url in zip(quals, cdn_urls)}
-        download_url = f"https://{quality_url_map[chosen_height]}"
-
-        if not config.no_title:
-            config.path = os.path.join(config.path, f"{self.title}.mp4")
-
         try:
-            return await self.core.legacy_download(url=download_url, configuration=config)
+            await self.load_fields("direct_download_urls", "title")
+            cdn_urls = self.direct_download_urls
+            quals = self.video_qualities  # e.g., ["360", "480", "720"]
+            if not quals:
+                raise NotAvailable(f"No download qualities available for {self.url}")
 
+            config = copy.deepcopy(configuration)
+
+            qn = normalize_quality_value(config.quality)
+            chosen_height = choose_quality_from_list(quals, qn)
+
+            quality_url_map = {int(re.search(r'(\d{3,4})', q).group(1)): url for q, url in zip(quals, cdn_urls)}
+            download_url = f"https://{quality_url_map[chosen_height]}"
+
+            if not config.no_title:
+                config.path = os.path.join(config.path, f"{self.title}.mp4")
+
+            return await self.core.legacy_download(url=download_url, configuration=config)
+        except DownloadCancelled:
+            raise
+        except NotAvailable:
+            logger.exception("No download qualities available for %s", self.url)
+            raise
         except Exception as e:
-            raise DownloadFailed(str(e))
+            logger.exception("Download failed for %s: %s", self.url, e)
+            raise DownloadFailed(f"Download failed for {self.url}: {e}") from e
 
 
 class Client:
@@ -501,7 +518,8 @@ async def async_main(args_list: list[str] | None = None):
                 await video.download(configuration=config)
                 log(f"Done -> {video.title}", "bold green")
             except Exception as e:
-                log(f"Error downloading {video.title or video.url}: {e}", "bold red")
+                logger.exception("CLI download failed for %s", video.url)
+                log(f"Error downloading {video.url}: {e}", "bold red")
 
     tasks = [safe_download(v) for v in videos]
     await asyncio.gather(*tasks)
@@ -513,6 +531,7 @@ run_main = async_main
 
 
 def main():
+    configure_app_logging(level=logging.INFO)
     try:
         asyncio.run(async_main())
     except KeyboardInterrupt:
@@ -521,4 +540,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
