@@ -15,7 +15,7 @@ except ImportError:
     Table = None
 from enum import Enum
 from random import choice
-from typing import AsyncGenerator, ClassVar
+from typing import Any, AsyncGenerator, ClassVar
 from dataclasses import dataclass
 from curl_cffi import AsyncSession
 from selectolax.lexbor import LexborHTMLParser
@@ -192,33 +192,102 @@ class Video(BaseMedia):
     async def _load_html(self) -> dict[str, object]:
         is_mobile_fix, html_content = await get_html_content(core=self.core, url=self.url)
         data: dict = await asyncio.to_thread(self._extract_html, is_mobile_fix, html_content)
-        cdn_url = f"https://{data['cdn_url']}"
-        is_mobile_fix, html_content = await get_html_content(core=self.core, url=cdn_url)
-        data["direct_download_urls"] = PATTERN_EXTRACT_CDN_URLS.findall(html_content)
+        cdn_target = data.get("cdn_url")
+        if not cdn_target:
+            logger.warning("No CDN URL found for %s", self.url)
+            data["direct_download_urls"] = []
+            return data
+
+        cdn_url = cdn_target if cdn_target.startswith("http") else f"https://{cdn_target.lstrip('/')}"
+        try:
+            _, cdn_html = await get_html_content(core=self.core, url=cdn_url)
+            data["direct_download_urls"] = PATTERN_EXTRACT_CDN_URLS.findall(cdn_html)
+            if not data["direct_download_urls"]:
+                logger.warning("No direct download URLs extracted from CDN for %s", self.url)
+        except Exception as e:
+            logger.warning("Failed to fetch CDN content from %s for %s: %s", cdn_url, self.url, e)
+            data["direct_download_urls"] = []
+
         return data
 
+    def _extract_html(self, is_mobile_fix: bool, html_content: str | None = None) -> dict[str, Any]:
+        if isinstance(self, bool):
+            url = "unknown"
+            html_content = is_mobile_fix  # type: ignore
+            is_mobile_fix = self
+        else:
+            url = getattr(self, "url", "unknown")
+            assert html_content is not None
 
-    @staticmethod
-    def _extract_html(is_mobile_fix: bool, html_content: str) -> dict[str, str | list[str]]:
-        lexbor = LexborHTMLParser(html_content)
+        parser = LexborHTMLParser(html_content)
+
+        # Layout anchors: '#playerWrapper' or '.box.page-content' are expected on all video pages
+        if not parser.css_first("#playerWrapper") and not parser.css_first(".box.page-content"):
+            logger.warning(
+                "Video container anchor ('#playerWrapper' / '.box.page-content') not found for %s; page layout may have changed.",
+                url,
+            )
 
         if is_mobile_fix:
-            title = lexbor.css_first("h1[style*='font-size:18px']").text(strip=True)
-            length = lexbor.css("span.meta_data")[1].text(strip=True)
-            publish_date = lexbor.css("span.meta_data")[0].text(strip=True)
-            elements = lexbor.css("a.fol.click-trigger")
-            tags = [category.text() for category in elements]
-
+            title_node = parser.css_first("h1[style*='font-size:18px']") or parser.css_first("h1")
+            meta_spans = parser.css("span.meta_data")
+            publish_date = meta_spans[0].text(strip=True) if len(meta_spans) > 0 else None
+            length = meta_spans[1].text(strip=True) if len(meta_spans) > 1 else None
+            tag_nodes = parser.css("a.fol.click-trigger") or parser.css("a[href*='/category/']")
         else:
-            title = lexbor.css_first("h1.main-h1").text(strip=True)
-            length = lexbor.css_first("li.icon.fa-clock-o").text()
-            publish_date = lexbor.css_first("li.icon.fa-calendar").text()
-            elements = lexbor.css("a.tag-link.click-trigger")
-            tags = [element.text() for element in elements]
+            title_node = parser.css_first("h1.main-h1") or parser.css_first("h1")
+            clock_node = parser.css_first("li.icon.fa-clock-o") or parser.css_first("li.fa-clock-o")
+            length = clock_node.text(strip=True) if clock_node else None
+            calendar_node = parser.css_first("li.icon.fa-calendar") or parser.css_first("li.fa-calendar")
+            publish_date = calendar_node.text(strip=True) if calendar_node else None
+            tag_nodes = parser.css("a.tag-link.click-trigger") or parser.css("a[href*='/category/']")
 
-        cdn_url = PATTERN_CDN_URL.search(html_content).group(1)
-        stars = lexbor.css("a.click-trigger") # Works also for mobile version
-        pornstars = [star.text() for star in stars]
+        title = title_node.text(strip=True) if title_node else None
+        tags = [el.text(strip=True) for el in tag_nodes if el.text(strip=True)]
+
+        # Graceful fallbacks
+        if not length and (meta_spans := parser.css("span.meta_data")) and len(meta_spans) > 1:
+            length = meta_spans[1].text(strip=True)
+        if not publish_date and (meta_spans := parser.css("span.meta_data")) and len(meta_spans) > 0:
+            publish_date = meta_spans[0].text(strip=True)
+        if not tags:
+            tag_nodes = parser.css("a[href*='/category/']")
+            tags = [el.text(strip=True) for el in tag_nodes if el.text(strip=True)]
+
+        if not title:
+            logger.warning("Title not found for %s", url)
+        if not length:
+            logger.warning("Length not found for %s", url)
+        if not publish_date:
+            logger.warning("Publish date not found for %s", url)
+        if not tags:
+            logger.warning("Tags not found for %s", url)
+
+        cdn_url = None
+        cdn_match = PATTERN_CDN_URL.search(html_content) or re.search(
+            r"/blocks/(?:alt|native)player\.php\?i=//(.*?)['\",]", html_content
+        )
+        if cdn_match:
+            cdn_url = cdn_match.group(1)
+        else:
+            iframe = (
+                parser.css_first("#playerWrapper iframe")
+                or parser.css_first(".videoWrapper iframe")
+                or parser.css_first("iframe")
+            )
+            if iframe and (src := iframe.attributes.get("src")):
+                cdn_url = re.sub(r"^https?:?//|^//", "", src)
+
+        if not cdn_url:
+            logger.warning("CDN URL not found for %s", url)
+
+        # Extract pornstars / actresses
+        stars = (
+            parser.css("li.icon.fa-star-o a")
+            or parser.css("li.fa-star-o a")
+            or parser.css("a[href*='/actress/']")
+        )
+        pornstars = list(dict.fromkeys(star.text(strip=True) for star in stars if star.text(strip=True)))
 
         return {
             "title": title,
@@ -226,16 +295,15 @@ class Video(BaseMedia):
             "pornstars": pornstars,
             "length": length,
             "publish_date": publish_date,
-            "tags": tags
+            "tags": tags,
         }
 
-
     @property
-    def video_qualities(self) -> list:
+    def video_qualities(self) -> list[str]:
         """
         :return: (list) The available qualities of the video
         """
-        quals = self.direct_download_urls
+        quals = self.direct_download_urls or []
         qualities = set()  # Using a set to avoid duplicates
 
         for url in quals:
@@ -245,11 +313,10 @@ class Video(BaseMedia):
 
         return sorted(qualities, key=int)
 
-
     async def download(self, configuration: DownloadConfigRAW):
         try:
             await self.load_fields("direct_download_urls", "title")
-            cdn_urls = self.direct_download_urls
+            cdn_urls = self.direct_download_urls or []
             quals = self.video_qualities  # e.g., ["360", "480", "720"]
             if not quals:
                 raise NotAvailable(f"No download qualities available for {self.url}")
@@ -259,8 +326,16 @@ class Video(BaseMedia):
             qn = normalize_quality_value(config.quality)
             chosen_height = choose_quality_from_list(quals, qn)
 
-            quality_url_map = {int(re.search(r'(\d{3,4})', q).group(1)): url for q, url in zip(quals, cdn_urls)}
-            download_url = f"https://{quality_url_map[chosen_height]}"
+            quality_url_map = {}
+            for url in cdn_urls:
+                if m := PATTERN_RESOLUTION.search(url):
+                    quality_url_map[int(m.group(1))] = url
+
+            target_url = quality_url_map.get(chosen_height)
+            if not target_url:
+                raise NotAvailable(f"Chosen quality {chosen_height} is not available for {self.url}")
+
+            download_url = target_url if target_url.startswith("http") else f"https://{target_url.lstrip('/')}"
 
             if not config.no_title:
                 config.path = os.path.join(config.path, f"{self.title}.mp4")
