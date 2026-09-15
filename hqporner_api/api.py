@@ -1,12 +1,12 @@
 from __future__ import annotations
-import os
 import re
-import copy
 import asyncio
 import logging
 import argparse
 
-from base_api.modules.logger import configure_app_logging
+from hqporner_api.modules import errors as provider_errors
+from base_api.modules.provider import fetch_content, download_errors, prepare_download_config
+from base_api.modules.logger import configure_app_logging, get_logger
 try:
     from rich.console import Console
     from rich.table import Table
@@ -39,16 +39,6 @@ from base_api import (
     scrape_stream,
 )
 from base_api.modules.static_functions import choose_quality_from_list, normalize_quality_value
-from base_api.modules.errors import (
-    DownloadCancelled,
-    BotProtectionDetected,
-    HTTPStatusError,
-    InvalidProxy,
-    NetworkRequestError,
-    RequestRetriesExhausted,
-    ResourceGone,
-    UnknownError,
-)
 
 from hqporner_api.modules.errors import (NotFound, NetworkError, NotAvailable, UnknownNetworkError, BotDetection,
                                         ProxyError, InvalidActress, DownloadFailed)
@@ -59,8 +49,7 @@ from hqporner_api.modules.consts import (root_random, root_url, root_url_categor
 from hqporner_api.modules.locals import Category, Sort
 
 
-logger = logging.getLogger("HQPorner API")
-logger.addHandler(logging.NullHandler())
+logger = get_logger(__name__)
 
 SCRAPE_RETRY_POLICY = RetryPolicy(max_attempts=3)
 
@@ -69,45 +58,16 @@ on_error = default_on_error
 
 
 async def get_html_content(core: BaseCore, url: str, is_second_attempt: bool = False,
-                           is_mobile_fix: bool = False) -> tuple[bool, str]:
+                           is_mobile_fix: bool = False, *, owner=None) -> tuple[bool, str]:
     try:
-        content = await core.fetch_text(url)
+        content = await fetch_content(core, url, logger=logger, owner=owner, error_types=provider_errors)
         return is_mobile_fix, content
-
-    except HTTPStatusError as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        if e.status_code == 404:
-            if is_second_attempt:
-                raise NotFound(f"Server returned 404 for: {url}") from e
-
-            mobile_url = url.replace("hqporner.com", "m.hqporner.com")
-            return await get_html_content(
-                url=mobile_url,
-                is_second_attempt=True,
-                core=core,
-                is_mobile_fix=True,
-            )
-        raise NetworkError(f"Request failed for {url}: {e}") from e
-
-    except (NetworkRequestError, RequestRetriesExhausted) as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise NetworkError(f"Request failed for {url}: {e}") from e
-
-    except InvalidProxy as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise ProxyError(f"Request failed for {url}: {e}") from e
-
-    except BotProtectionDetected as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise BotDetection(f"Request failed for {url}: {e}") from e
-
-    except UnknownError as e:
-        logger.exception("Request failed for %s: %s", url, e)
-        raise UnknownNetworkError(f"Request failed for {url}: {e}") from e
-
-    except Exception:
-        logger.exception("Failed to fetch or decode response for %s", url)
-        raise
+    except NotFound:
+        if is_second_attempt:
+            raise
+        mobile_url = url.replace("hqporner.com", "m.hqporner.com")
+        return await get_html_content(core, mobile_url, is_second_attempt=True,
+                                      is_mobile_fix=True, owner=owner)
 
 
 
@@ -190,7 +150,7 @@ class Video(BaseMedia):
     loader_methods: ClassVar[dict[str, str]] = {"html": "_load_html"}
 
     async def _load_html(self) -> dict[str, object]:
-        is_mobile_fix, html_content = await get_html_content(core=self.core, url=self.url)
+        is_mobile_fix, html_content = await get_html_content(core=self.core, url=self.url, owner=self)
         data: dict = await asyncio.to_thread(self._extract_html, is_mobile_fix, html_content)
         cdn_target = data.get("cdn_url")
         if not cdn_target:
@@ -200,12 +160,12 @@ class Video(BaseMedia):
 
         cdn_url = cdn_target if cdn_target.startswith("http") else f"https://{cdn_target.lstrip('/')}"
         try:
-            _, cdn_html = await get_html_content(core=self.core, url=cdn_url)
+            _, cdn_html = await get_html_content(core=self.core, url=cdn_url, owner=self)
             data["direct_download_urls"] = PATTERN_EXTRACT_CDN_URLS.findall(cdn_html)
             if not data["direct_download_urls"]:
                 logger.warning("No direct download URLs extracted from CDN for %s", self.url)
         except Exception as e:
-            logger.warning("Failed to fetch CDN content from %s for %s: %s", cdn_url, self.url, e)
+            logger.warning("Failed to fetch CDN content from %s for %s: %s", cdn_url, self.url, e, exc_info=True)
             data["direct_download_urls"] = []
 
         return data
@@ -313,42 +273,32 @@ class Video(BaseMedia):
 
         return sorted(qualities, key=int)
 
+    @download_errors(DownloadFailed)
     async def download(self, configuration: DownloadConfigRAW):
-        try:
-            await self.load_fields("direct_download_urls", "title")
-            cdn_urls = self.direct_download_urls or []
-            quals = self.video_qualities  # e.g., ["360", "480", "720"]
-            if not quals:
-                raise NotAvailable(f"No download qualities available for {self.url}")
+        await self.load_fields("direct_download_urls", "title")
+        cdn_urls = self.direct_download_urls or []
+        quals = self.video_qualities  # e.g., ["360", "480", "720"]
+        if not quals:
+            raise NotAvailable(f"No download qualities available for {self.url}")
 
-            config = copy.deepcopy(configuration)
+        config = prepare_download_config(configuration, self.title)
 
-            qn = normalize_quality_value(config.quality)
-            chosen_height = choose_quality_from_list(quals, qn)
+        qn = normalize_quality_value(config.quality)
+        chosen_height = choose_quality_from_list(quals, qn)
 
-            quality_url_map = {}
-            for url in cdn_urls:
-                if m := PATTERN_RESOLUTION.search(url):
-                    quality_url_map[int(m.group(1))] = url
+        quality_url_map = {}
+        for url in cdn_urls:
+            if m := PATTERN_RESOLUTION.search(url):
+                quality_url_map[int(m.group(1))] = url
 
-            target_url = quality_url_map.get(chosen_height)
-            if not target_url:
-                raise NotAvailable(f"Chosen quality {chosen_height} is not available for {self.url}")
+        target_url = quality_url_map.get(chosen_height)
+        if not target_url:
+            raise NotAvailable(f"Chosen quality {chosen_height} is not available for {self.url}")
 
-            download_url = target_url if target_url.startswith("http") else f"https://{target_url.lstrip('/')}"
+        download_url = target_url if target_url.startswith("http") else f"https://{target_url.lstrip('/')}"
 
-            if not config.no_title:
-                config.path = os.path.join(config.path, f"{self.title}.mp4")
 
-            return await self.core.legacy_download(url=download_url, configuration=config)
-        except DownloadCancelled:
-            raise
-        except NotAvailable:
-            logger.exception("No download qualities available for %s", self.url)
-            raise
-        except Exception as e:
-            logger.exception("Download failed for %s: %s", self.url, e)
-            raise DownloadFailed(f"Download failed for {self.url}: {e}") from e
+        return await self.core.legacy_download(url=download_url, configuration=config)
 
 
 class Client:
@@ -458,7 +408,7 @@ class Client:
         """
         :return: (list) Returns all categories of HQporner as a list of strings
         """
-        _, html_content = await get_html_content(url="https://hqporner.com/categories", core=self.core)
+        _, html_content = await get_html_content(url="https://hqporner.com/categories", core=self.core, owner=self)
         assert isinstance(html_content, str)
         parser = LexborHTMLParser(html_content)
         results = parser.css("a.click-trigger")
@@ -468,7 +418,7 @@ class Client:
         """
         :return: Video object (random video from HQPorner)
         """
-        _, html_content = await get_html_content(url=root_random, core=self.core)
+        _, html_content = await get_html_content(url=root_random, core=self.core, owner=self)
         assert isinstance(html_content, str)
         videos = extractor_random_video(html_content)
         video_url = choice(videos) # The random-porn from HQPorner returns 3 videos, so we pick one of them
