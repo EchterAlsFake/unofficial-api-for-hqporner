@@ -122,5 +122,5 @@ async def test_video(client):
     assert isinstance(video.cdn_url, str) and len(video.cdn_url) > 1
     assert isinstance(video.publish_date, str) and len(video.publish_date) > 1
 
-    config_low = DownloadConfigRAW(quality="best")
+    config_low = DownloadConfigRAW(quality="worst")
     assert await video.download(config_low) is True

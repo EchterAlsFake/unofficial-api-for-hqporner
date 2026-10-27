@@ -3,6 +3,8 @@ import re
 import asyncio
 import logging
 import argparse
+from urllib.parse import quote_plus, urlsplit, urljoin
+from base_api import update_url_query, append_url_path
 
 from hqporner_api.modules import errors as provider_errors
 from base_api.modules.provider import fetch_content, download_errors, prepare_download_config
@@ -19,7 +21,7 @@ from typing import Any, AsyncGenerator, ClassVar
 from dataclasses import dataclass
 from curl_cffi import AsyncSession
 from selectolax.lexbor import LexborHTMLParser
-from base_api.modules.config import IteratorConfig
+from base_api.modules.config import IteratorConfig, RuntimeConfig
 from base_api import (
     BaseCore,
     BaseMedia,
@@ -63,9 +65,10 @@ async def get_html_content(core: BaseCore, url: str, is_second_attempt: bool = F
         content = await fetch_content(core, url, logger=logger, owner=owner, error_types=provider_errors)
         return is_mobile_fix, content
     except NotFound:
-        if is_second_attempt:
+        parsed = urlsplit(url)
+        if is_second_attempt or parsed.hostname not in {"hqporner.com", "www.hqporner.com"}:
             raise
-        mobile_url = url.replace("hqporner.com", "m.hqporner.com")
+        mobile_url = parsed._replace(netloc="m.hqporner.com").geturl()
         return await get_html_content(core, mobile_url, is_second_attempt=True,
                                       is_mobile_fix=True, owner=owner)
 
@@ -83,20 +86,18 @@ class Checks:
         :param: actress: (str) The name or URL of the actress to check for
         :return: (str) The name of the actress if valid, otherwise raises InvalidActress Exception
         """
-        if actress.startswith("https://"):
-            match = PATTERN_CHECK_URL_ACTRESS.match(actress)
-            if match:
-                name_extraction = re.compile(r'https://hqporner.com/actress/(.+)')
-                name = name_extraction.search(actress).group(1)
-                return name
-
-            else:
-                raise InvalidActress(f"Invalid actress URL: {actress}")
-
-        else:
-            actress = actress.replace(" ", "-")  # For later url processing (makes sense, trust me)
-            return actress
-            # I assume that if it's not a URL, the user was smart enough to enter just the name lol
+        actress = actress.strip()
+        parsed = urlsplit(actress)
+        if parsed.scheme or parsed.netloc:
+            match = re.fullmatch(r"/actress/([^/]+)/?", parsed.path)
+            if (parsed.scheme in {"http", "https"}
+                    and parsed.hostname in {"hqporner.com", "www.hqporner.com", "m.hqporner.com"}
+                    and match):
+                return match.group(1)
+            raise InvalidActress(f"Invalid actress URL: {actress}")
+        if not actress or "/" in actress:
+            raise InvalidActress(f"Invalid actress name: {actress}")
+        return actress.lower().replace(" ", "-")
 
 
 class Pagination(Enum):
@@ -107,21 +108,24 @@ class Pagination(Enum):
 def build_page_url(base_url: str, page: int, *,
                    mode: Pagination,
                    page_param: str = "p") -> str:
-    if page <= 1:
+    if page < 1:
+        raise ValueError("page must be positive")
+    if page == 1:
         return base_url
 
     if mode is Pagination.QUERY:
-        sep = "&" if "?" in base_url else "?"
-        return f"{base_url}{sep}{page_param}={page}"
+        return update_url_query(base_url, **{page_param: page})
 
     elif mode is Pagination.PATH:
-        return f"{base_url.rstrip('/')}/{page}"
+        return append_url_path(base_url, page)
 
     raise ValueError(f"Unsupported pagination mode {mode!r} for {base_url}")
 
 
-def build_page_urls(base: str, pagination: Pagination = Pagination.QUERY, pages: int | None = None,
+def build_page_urls(base: str, pagination: Pagination = Pagination.QUERY, pages: int = 1,
                     page_param: str = "p", start_page: int = 1) -> list[str]:
+    if pages < 1 or start_page < 1:
+        raise ValueError("pages and start_page must be positive")
     page_urls = []
     base = base.rstrip("/")
     for i, page in enumerate(range(start_page, start_page + pages), start=0):
@@ -161,7 +165,13 @@ class Video(BaseMedia):
         cdn_url = cdn_target if cdn_target.startswith("http") else f"https://{cdn_target.lstrip('/')}"
         try:
             _, cdn_html = await get_html_content(core=self.core, url=cdn_url, owner=self)
-            data["direct_download_urls"] = PATTERN_EXTRACT_CDN_URLS.findall(cdn_html)
+            parser = LexborHTMLParser(cdn_html)
+            # Some CDN pages keep the download anchors inside a JS HTML string.
+            hrefs = [node.attributes["href"] for node in parser.css("a[href]")]
+            hrefs.extend(PATTERN_EXTRACT_CDN_URLS.findall(cdn_html))
+            data["direct_download_urls"] = list(dict.fromkeys(
+                urljoin(cdn_url, href) for href in hrefs if PATTERN_RESOLUTION.search(href)
+            ))
             if not data["direct_download_urls"]:
                 logger.warning("No direct download URLs extracted from CDN for %s", self.url)
         except Exception as e:
@@ -349,7 +359,7 @@ class Client:
         """
         name = Checks().check_actress(name)
         final_url = f"{root_url_actress}{name}"
-        page_urls = build_page_urls(pagination=Pagination.PATH, base=final_url, pages=pages, start_page=0)
+        page_urls = build_page_urls(pagination=Pagination.PATH, base=final_url, pages=pages)
         return self._video_stream(page_urls, iterator_config=iterator_config)
 
     def get_videos_by_category(
@@ -365,7 +375,7 @@ class Client:
         :return: Video object
         """
         url = f"{root_url_category}{category}"
-        page_urls = build_page_urls(pagination=Pagination.PATH, base=url, pages=pages, start_page=0)
+        page_urls = build_page_urls(pagination=Pagination.PATH, base=url, pages=pages)
         return self._video_stream(page_urls, iterator_config=iterator_config)
 
     def search_videos(
@@ -380,7 +390,7 @@ class Client:
         :param iterator_config: Iterator concurrency, loading, ordering, and error behavior.
         :return: Video object
         """
-        query = query.replace(" ", "+")
+        query = quote_plus(query)
         url = f"{root_url}?q={query}"
         page_urls = build_page_urls(pagination=Pagination.QUERY, base=url, pages=pages, start_page=1)
         return self._video_stream(page_urls, iterator_config=iterator_config)
@@ -397,11 +407,11 @@ class Client:
         :param iterator_config: Iterator concurrency, loading, ordering, and error behavior.
         :return: Video object
         """
-        if sort_by == "all_time":
+        if sort_by in ("all_time", "all-time"):
             url = root_url_top
         else:
             url = f"{root_url_top}{sort_by}"
-        page_urls = build_page_urls(base=url, start_page=0, pagination=Pagination.PATH, pages=pages)
+        page_urls = build_page_urls(base=url, pagination=Pagination.PATH, pages=pages)
         return self._video_stream(page_urls, iterator_config=iterator_config)
 
     async def get_all_categories(self) -> list[str]:
@@ -411,8 +421,8 @@ class Client:
         _, html_content = await get_html_content(url="https://hqporner.com/categories", core=self.core, owner=self)
         assert isinstance(html_content, str)
         parser = LexborHTMLParser(html_content)
-        results = parser.css("a.click-trigger")
-        return [result.text() for result in results]
+        results = parser.css("h3 a[href^='/category/']")
+        return list(dict.fromkeys(result.text(strip=True) for result in results if result.text(strip=True)))
 
     async def get_random_video(self, load_html: bool = True) -> Video:
         """
@@ -437,7 +447,7 @@ class Client:
         :param iterator_config: Iterator concurrency, loading, ordering, and error behavior.
         :return: Video object
         """
-        page_urls = build_page_urls(pagination=Pagination.PATH, pages=pages, base=root_brazzers, start_page=0)
+        page_urls = build_page_urls(pagination=Pagination.PATH, pages=pages, base=root_brazzers)
         return self._video_stream(page_urls, iterator_config=iterator_config)
 
 
@@ -466,6 +476,8 @@ def create_parser() -> argparse.ArgumentParser:
 async def async_main(args_list: list[str] | None = None):
     parser = create_parser()
     args = parser.parse_args(args_list)
+    if args.pages < 1 or args.concurrency < 1:
+        parser.error("--pages and --concurrency must be positive")
     
     console = Console() if Console else None
     
@@ -478,78 +490,85 @@ async def async_main(args_list: list[str] | None = None):
     no_title_bool = args.no_title.lower() in ("true", "1", "yes", "t", "y") if isinstance(args.no_title, str) else bool(args.no_title)
     config = DownloadConfigRAW(quality=args.quality, path=args.output, no_title=no_title_bool)
     
-    client = Client()
-    videos = []
+    async with BaseCore(RuntimeConfig()) as core:
+        client = Client(core=core)
+        videos = []
 
-    if args.download:
-        log(f"Fetching video info for: {args.download}", "bold blue")
-        videos.append(await client.get_video(args.download))
+        if args.download:
+            log(f"Fetching video info for: {args.download}", "bold blue")
+            videos.append(await client.get_video(args.download))
         
-    elif args.file:
-        log(f"Reading URLs from: {args.file}", "bold blue")
-        with open(args.file, "r") as file:
-            content = file.read().splitlines()
+        elif args.file:
+            log(f"Reading URLs from: {args.file}", "bold blue")
+            with open(args.file, "r") as file:
+                content = file.read().splitlines()
             
-        async def fetch_video(url):
-            return await client.get_video(url)
+            async def fetch_video(url):
+                return await client.get_video(url)
             
-        fetched = await asyncio.gather(*[fetch_video(url) for url in content if url.strip()])
-        videos.extend(fetched)
+            fetched = await asyncio.gather(*[fetch_video(url) for url in content if url.strip()])
+            videos.extend(fetched)
         
-    elif args.random:
-        log("Fetching a random video...", "bold blue")
-        videos.append(await client.get_random_video())
+        elif args.random:
+            log("Fetching a random video...", "bold blue")
+            videos.append(await client.get_random_video())
         
-    elif args.search:
-        log(f"Searching for: {args.search}", "bold blue")
-        async for scrape_result in client.search_videos(args.search, pages=args.pages):
-            videos.append(scrape_result.unwrap())
+        elif args.search:
+            log(f"Searching for: {args.search}", "bold blue")
+            async for scrape_result in client.search_videos(args.search, pages=args.pages):
+                videos.append(scrape_result.unwrap())
                 
-    elif args.actress:
-        log(f"Fetching videos for actress: {args.actress}", "bold blue")
-        async for scrape_result in client.get_videos_by_actress(args.actress, pages=args.pages):
-            videos.append(scrape_result.unwrap())
+        elif args.actress:
+            log(f"Fetching videos for actress: {args.actress}", "bold blue")
+            async for scrape_result in client.get_videos_by_actress(args.actress, pages=args.pages):
+                videos.append(scrape_result.unwrap())
                 
-    elif args.category:
-        log(f"Fetching videos for category: {args.category}", "bold blue")
-        async for scrape_result in client.get_videos_by_category(args.category, pages=args.pages):
-            videos.append(scrape_result.unwrap())
+        elif args.category:
+            log(f"Fetching videos for category: {args.category}", "bold blue")
+            async for scrape_result in client.get_videos_by_category(args.category, pages=args.pages):
+                videos.append(scrape_result.unwrap())
 
-    if not videos:
-        log("No videos found to download.", "bold red")
-        return
+        if not videos:
+            log("No videos found to download.", "bold red")
+            return
         
-    if console and Table:
-        table = Table(title="Videos to Download")
-        table.add_column("Title", style="cyan")
-        table.add_column("Length", style="magenta")
-        table.add_column("URL", style="green", overflow="fold")
-        for v in videos:
-            table.add_row(str(v.title or "Unknown"), str(v.length or "Unknown"), str(v.url or "Unknown"))
-        console.print(table)
-    else:
-        for v in videos:
-            print(f"- {v.title or 'Unknown'} ({v.length or 'Unknown'}): {v.url}")
+        if console and Table:
+            table = Table(title="Videos to Download")
+            table.add_column("Title", style="cyan")
+            table.add_column("Length", style="magenta")
+            table.add_column("URL", style="green", overflow="fold")
+            for v in videos:
+                table.add_row(str(v.title or "Unknown"), str(v.length or "Unknown"), str(v.url or "Unknown"))
+            console.print(table)
+        else:
+            for v in videos:
+                print(f"- {v.title or 'Unknown'} ({v.length or 'Unknown'}): {v.url}")
         
-    log(f"\nStarting download of {len(videos)} video(s) with concurrency {args.concurrency}...\n", "bold yellow")
+        log(f"\nStarting download of {len(videos)} video(s) with concurrency {args.concurrency}...\n", "bold yellow")
 
-    semaphore = asyncio.Semaphore(args.concurrency)
+        semaphore = asyncio.Semaphore(args.concurrency)
     
-    async def safe_download(video):
-        async with semaphore:
-            try:
-                await video.load_fields("direct_download_urls")
-                log(f"Downloading -> {video.title}", "cyan")
-                await video.download(configuration=config)
-                log(f"Done -> {video.title}", "bold green")
-            except Exception as e:
-                logger.exception("CLI download failed for %s", video.url)
-                log(f"Error downloading {video.url}: {e}", "bold red")
+        async def safe_download(video):
+            async with semaphore:
+                try:
+                    await video.load_fields("direct_download_urls")
+                    log(f"Downloading -> {video.title}", "cyan")
+                    result = await video.download(configuration=config)
+                    if result is False or getattr(result, "status", None) == "failed":
+                        raise DownloadFailed("Download did not complete")
+                    log(f"Done -> {video.title}", "bold green")
+                    return True
+                except Exception as e:
+                    logger.exception("CLI download failed for %s", video.url)
+                    log(f"Error downloading {video.url}: {e}", "bold red")
+                    return False
 
-    tasks = [safe_download(v) for v in videos]
-    await asyncio.gather(*tasks)
-    
-    log("All downloads completed!", "bold green")
+        tasks = [safe_download(v) for v in videos]
+        results = await asyncio.gather(*tasks)
+        if all(results):
+            log("All downloads completed!", "bold green")
+        else:
+            log("One or more downloads failed.", "bold red")
 
 
 run_main = async_main
